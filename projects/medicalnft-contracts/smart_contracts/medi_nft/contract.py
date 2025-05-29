@@ -1,61 +1,53 @@
 from pyteal import *
 
-def approval_program():
-    # Global keys
-    creator = Bytes("creator")      # Doctor's wallet
-    owner = Bytes("owner")          # Patient's wallet
-    ipfs_cid = Bytes("cid")         # Encrypted CID
-    access = Bytes("access")        # Who can view
-    revoked = Bytes("revoked")      # Access revoked flag
+def approval():
+    owner = Bytes("owner")       # Global: patient address
+    viewer = Bytes("viewer")     # Global: who can view
+    expires = Bytes("expires")   # Global: time limit
 
-    # App creation (mint NFT)
     on_create = Seq([
-        Assert(Txn.application_args.length() == Int(2)),  # [cid, owner]
-        App.globalPut(creator, Txn.sender()),
-        App.globalPut(ipfs_cid, Txn.application_args[0]),  # Encrypted IPFS CID
-        App.globalPut(owner, Txn.application_args[1]),
-        App.globalPut(revoked, Int(0)),
-        App.globalPut(access, Global.zero_address()),  # No one has access initially
-        Return(Int(1))
+        App.globalPut(owner, Txn.sender()),
+        App.globalPut(viewer, Global.zero_address()),
+        App.globalPut(expires, Int(0)),
+        Approve()
     ])
 
-    # Share NFT (only patient can share)
-    share_access = Seq([
-        Assert(Txn.application_args.length() == Int(2)),  # ["share", address]
-        Assert(Txn.sender() == App.globalGet(owner)),
-        App.globalPut(access, Txn.application_args[1]),
-        App.globalPut(revoked, Int(0)),
-        Return(Int(1))
+    is_owner = Txn.sender() == App.globalGet(owner)
+
+    # Set viewer and expiry
+    set_viewer = Seq([
+        Assert(is_owner),
+        App.globalPut(viewer, Txn.application_args[1]),
+        App.globalPut(expires, Btoi(Txn.application_args[2])),  # timestamp
+        Approve()
     ])
 
-    # Revoke access (only patient)
-    revoke_access = Seq([
-        Assert(Txn.sender() == App.globalGet(owner)),
-        App.globalPut(revoked, Int(1)),
-        Return(Int(1))
+    # Revoke viewer
+    revoke_viewer = Seq([
+        Assert(is_owner),
+        App.globalPut(viewer, Global.zero_address()),
+        App.globalPut(expires, Int(0)),
+        Approve()
     ])
 
-    # View CID (only if not revoked)
-    view_access = Seq([
-        Assert(App.globalGet(revoked) == Int(0)),
-        Assert(Txn.sender() == App.globalGet(access)),
-        Return(Int(1))
-    ])
-
-    # Handle NoOp calls (custom methods)
-    handle_noop = Cond(
-        [Txn.application_args[0] == Bytes("share"), share_access],
-        [Txn.application_args[0] == Bytes("revoke"), revoke_access],
-        [Txn.application_args[0] == Bytes("view"), view_access],
+    # Check if viewer is allowed
+    view_allowed = And(
+        Txn.sender() == App.globalGet(viewer),
+        Global.latest_timestamp() <= App.globalGet(expires)
     )
 
-    # Program routing
+    allow_view = If(view_allowed, Approve(), Reject())
+
     program = Cond(
         [Txn.application_id() == Int(0), on_create],
-        [Txn.on_completion() == OnComplete.NoOp, handle_noop],
+        [Txn.on_completion() == OnComplete.NoOp, Cond(
+            [Txn.application_args[0] == Bytes("set_viewer"), set_viewer],
+            [Txn.application_args[0] == Bytes("revoke_viewer"), revoke_viewer],
+            [Txn.application_args[0] == Bytes("view"), allow_view]
+        )],
     )
 
     return program
 
-def clear_state_program():
-    return Return(Int(1))
+def clear():
+    return Approve()
